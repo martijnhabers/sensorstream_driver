@@ -6,6 +6,7 @@ A ROS 2 driver that streams sensor data from an iPhone running the SensorStream 
 
 | Topic                    | Type                                | QoS                      | Description              |
 |--------------------------|-------------------------------------|--------------------------|--------------------------|
+| `color_image`            | `sensor_msgs/msg/Image`             | Best effort, last 5 | Raw BGR camera frames for RViz |
 | `color_image/compressed` | `sensor_msgs/msg/CompressedImage`   | Best effort, last 5 | JPEG camera frames       |
 | `depth_image`            | `sensor_msgs/msg/Image`             | Reliable, last 10   | 16-bit depth (16UC1)     |
 | `imu/data`               | `sensor_msgs/msg/Imu`               | Reliable, last 10   | Accelerometer & gyroscope|
@@ -47,6 +48,12 @@ source install/setup.bash
 ros2 run sensorstream_driver sensorstream_node
 ```
 
+In another terminal, camera frames can be checked with:
+
+```bash
+ros2 topic echo /color_image/compressed --qos-reliability best_effort --once --no-arr
+```
+
 ### With custom ports
 
 ```bash
@@ -76,8 +83,6 @@ ros2 run sensorstream_driver sensorstream_node --ros-args \
   -p wifi_port:=5679 \
   -p usb_port:=2346
 ```
-
-
 
 
 

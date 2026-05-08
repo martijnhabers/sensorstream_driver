@@ -18,6 +18,9 @@ namespace sensorstream {
 struct CameraFrame {
   std::vector<uint8_t> jpeg_data;
   uint64_t timestamp_ns;
+  uint32_t width;
+  uint32_t height;
+  std::string frame_id;
 };
 
 struct DepthFrame {

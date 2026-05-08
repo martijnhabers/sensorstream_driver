@@ -76,6 +76,10 @@ static uint32_t read_be32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
 }
 
+static uint32_t read_le32(const uint8_t* p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
 static uint32_t read_net32(const uint8_t* p) {
   uint32_t v;
   std::memcpy(&v, p, 4);
@@ -102,8 +106,18 @@ static void dispatch_protobuf(const uint8_t* data, size_t len,
     frame.jpeg_data.assign(reinterpret_cast<const uint8_t*>(raw.data()),
                            reinterpret_cast<const uint8_t*>(raw.data()) + raw.size());
     frame.timestamp_ns = cam.timestamp();
+    frame.width = cam.width();
+    frame.height = cam.height();
+    frame.frame_id = cam.frame_id();
     if (cb.on_camera) cb.on_camera(std::move(frame));
-    RCLCPP_DEBUG(logger(), "%s camera frame dispatched", transport);
+    static size_t camera_count = 0;
+    ++camera_count;
+    if (camera_count <= 5 || camera_count % 30 == 0 || raw.empty() || cam.timestamp() == 0) {
+      RCLCPP_INFO(logger(),
+                  "%s camera frame decoded #%zu: timestamp=%lu, encoding='%s', size=%ux%u, image_bytes=%zu",
+                  transport, camera_count, cam.timestamp(), cam.encoding().c_str(),
+                  cam.width(), cam.height(), raw.size());
+    }
 
   } else if (msg.has_imu()) {
     if (cb.on_imu) cb.on_imu(msg.imu());
@@ -136,6 +150,14 @@ static void dispatch_protobuf(const uint8_t* data, size_t len,
   } else {
     RCLCPP_WARN(logger(), "%s: unknown protobuf message type", transport);
   }
+}
+
+static bool looks_like_sensor_message(const uint8_t* data, size_t len) {
+  if (len > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+  sensor::SensorMessage msg;
+  return msg.ParseFromArray(data, static_cast<int>(len)) &&
+         (msg.has_camera() || msg.has_imu() || msg.has_depth() ||
+          msg.has_gps() || msg.has_pointcloud());
 }
 
 // -------------------------
@@ -270,6 +292,7 @@ void start_usb_client(MessageCallbacks callbacks, int port,
 // -------------------------
 
 static constexpr size_t WIFI_HEADER_SIZE = 13;  // [msg_id:4][seq:4][is_last:1][data_size:4]
+static constexpr uint32_t MAX_WIFI_PAYLOAD_SIZE = 32 * 1024 * 1024;
 
 static void handle_wifi_connection(int sock, const sockaddr_in& addr,
                                    const MessageCallbacks& cb,
@@ -288,6 +311,8 @@ static void handle_wifi_connection(int sock, const sockaddr_in& addr,
   // message_id -> ChunkReceiver. Stale entries (lost chunk, ID wrap) are evicted
   // when a new message_id arrives that collides with an incomplete entry.
   std::unordered_map<uint32_t, ChunkReceiver> receivers;
+  size_t recv_count = 0;
+  bool warned_about_framing = false;
 
   while (!stop_flag.load()) {
     uint8_t tmp[RECV_BUF_SIZE];
@@ -304,17 +329,81 @@ static void handle_wifi_connection(int sock, const sockaddr_in& addr,
       break;
     }
 
+    ++recv_count;
+    if (recv_count <= 5 || recv_count % 30 == 0) {
+      RCLCPP_INFO(logger(), "WiFi: received packet #%zu from %s:%d: %zd bytes",
+                  recv_count, addr_str, ntohs(addr.sin_port), n);
+    }
+
     buf.insert(buf.end(), tmp, tmp + n);
 
     while (true) {
       size_t available = buf.size() - offset;
-      if (available < WIFI_HEADER_SIZE) break;
+      if (available < 4) break;
+
+      // Some senders use a simpler [protobuf_length:4][protobuf] TCP stream.
+      // Support it when the chunked 13-byte header is not plausible.
+      uint32_t pb_len_be = read_be32(buf.data() + offset);
+      uint32_t pb_len_le = read_le32(buf.data() + offset);
+      uint32_t pb_len = pb_len_be <= MAX_WIFI_PAYLOAD_SIZE ? pb_len_be : pb_len_le;
+      if (pb_len >= 8 && pb_len <= MAX_WIFI_PAYLOAD_SIZE && available >= 4 + pb_len &&
+          looks_like_sensor_message(buf.data() + offset + 4, pb_len)) {
+        RCLCPP_INFO(logger(), "WiFi: dispatching length-prefixed protobuf: %u bytes", pb_len);
+        dispatch_protobuf(buf.data() + offset + 4, pb_len, cb, "WiFi");
+        offset += 4 + pb_len;
+        continue;
+      }
+
+      if (available < WIFI_HEADER_SIZE) {
+        if (pb_len <= MAX_WIFI_PAYLOAD_SIZE && available >= 4 + pb_len) {
+          RCLCPP_INFO(logger(), "WiFi: dispatching length-prefixed protobuf: %u bytes", pb_len);
+          dispatch_protobuf(buf.data() + offset + 4, pb_len, cb, "WiFi");
+          offset += 4 + pb_len;
+          continue;
+        }
+        break;
+      }
 
       const uint8_t* h = buf.data() + offset;
       uint32_t message_id = read_be32(h);
       uint32_t sequence   = read_be32(h + 4);
       bool     is_last    = h[8] != 0;
       uint32_t data_size  = read_be32(h + 9);
+
+      if (data_size > MAX_WIFI_PAYLOAD_SIZE) {
+        const uint32_t le_data_size = read_le32(h + 9);
+        if (le_data_size <= MAX_WIFI_PAYLOAD_SIZE) {
+          message_id = read_le32(h);
+          sequence = read_le32(h + 4);
+          data_size = le_data_size;
+          if (recv_count <= 5) {
+            RCLCPP_INFO(logger(), "WiFi: using little-endian chunk header");
+          }
+        }
+      }
+
+      if (data_size > MAX_WIFI_PAYLOAD_SIZE) {
+        uint32_t pb_len_be = read_be32(h);
+        uint32_t pb_len_le = read_le32(h);
+        uint32_t pb_len = pb_len_be <= MAX_WIFI_PAYLOAD_SIZE ? pb_len_be : pb_len_le;
+        if (pb_len <= MAX_WIFI_PAYLOAD_SIZE && available >= 4 + pb_len) {
+          RCLCPP_WARN(logger(),
+                      "WiFi: chunk header looked invalid (data_size=%u), trying length-prefixed protobuf (%u bytes)",
+                      data_size, pb_len);
+          dispatch_protobuf(h + 4, pb_len, cb, "WiFi");
+          offset += 4 + pb_len;
+          continue;
+        }
+
+        if (!warned_about_framing) {
+          warned_about_framing = true;
+          RCLCPP_WARN(logger(),
+                      "WiFi: invalid frame header: msg_id=%u seq=%u is_last=%d data_size=%u available=%zu. "
+                      "This usually means the iOS sender framing does not match [msg_id:4][seq:4][is_last:1][data_size:4].",
+                      message_id, sequence, is_last, data_size, available);
+        }
+        break;
+      }
 
       if (available < WIFI_HEADER_SIZE + data_size) break;
 
