@@ -13,6 +13,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 
+#include <opencv2/imgcodecs.hpp>
+
 #include "sensorstream_driver/banner.hpp"
 #include "sensorstream_driver/protocol_handler.hpp"
 
@@ -62,8 +64,10 @@ public:
     rclcpp::QoS camera_qos(rclcpp::KeepLast(5));
     camera_qos.best_effort();
 
-    color_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+    color_compressed_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
       "color_image/compressed", camera_qos);
+    color_raw_pub_ = create_publisher<sensor_msgs::msg::Image>(
+      "color_image", camera_qos);
     depth_pub_ = create_publisher<sensor_msgs::msg::Image>(
       "depth_image", rclcpp::QoS(10));
     imu_pub_   = create_publisher<sensor_msgs::msg::Imu>(
@@ -101,7 +105,8 @@ public:
   void enqueue_pointcloud(sensor::PointCloud2 pc){ pcl_q_.push(std::move(pc));       }
 
 private:
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_compressed_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr           color_raw_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr           depth_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             imu_pub_;
   rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr       gps_pub_;
@@ -130,14 +135,54 @@ private:
   void camera_loop() {
     while (!stop_.load()) {
       auto item = camera_q_.pop(stop_);
-      if (!item || item->timestamp_ns == 0) continue;
+      if (!item) continue;
+      if (item->jpeg_data.empty()) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Dropping camera frame with empty JPEG payload");
+        continue;
+      }
 
       auto msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
-      msg->header.stamp    = ns_to_stamp(item->timestamp_ns);
-      msg->header.frame_id = "color_image";
+      if (item->timestamp_ns == 0) {
+        msg->header.stamp = now();
+      } else {
+        msg->header.stamp = ns_to_stamp(item->timestamp_ns);
+      }
+      msg->header.frame_id = item->frame_id.empty() ? "color_image" : item->frame_id;
       msg->format          = "jpeg";
       msg->data            = std::move(item->jpeg_data);
-      color_pub_->publish(std::move(msg));
+      const size_t jpeg_bytes = msg->data.size();
+
+      if (color_raw_pub_->get_subscription_count() > 0) {
+        const cv::Mat encoded(1, static_cast<int>(msg->data.size()), CV_8UC1, msg->data.data());
+        cv::Mat decoded = cv::imdecode(encoded, cv::IMREAD_COLOR);
+        if (decoded.empty()) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Failed to decode JPEG camera frame for raw /color_image");
+        } else {
+          auto raw_msg = std::make_unique<sensor_msgs::msg::Image>();
+          raw_msg->header = msg->header;
+          raw_msg->height = static_cast<uint32_t>(decoded.rows);
+          raw_msg->width = static_cast<uint32_t>(decoded.cols);
+          raw_msg->encoding = "bgr8";
+          raw_msg->is_bigendian = false;
+          raw_msg->step = static_cast<uint32_t>(decoded.cols * decoded.elemSize());
+          raw_msg->data.assign(decoded.datastart, decoded.dataend);
+          color_raw_pub_->publish(std::move(raw_msg));
+        }
+      }
+
+      color_compressed_pub_->publish(std::move(msg));
+
+      static size_t published_count = 0;
+      ++published_count;
+      if (published_count <= 5 || published_count % 30 == 0) {
+        RCLCPP_INFO(
+          get_logger(), "Published camera frame #%zu: jpeg_bytes=%zu",
+          published_count, jpeg_bytes);
+      }
     }
   }
 

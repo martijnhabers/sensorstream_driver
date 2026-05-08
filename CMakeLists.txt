@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS imgcodecs)
 
 # -------------------------
 # Protobuf
@@ -63,11 +64,13 @@ target_include_directories(sensorstream_node PRIVATE
   include
   ${CMAKE_CURRENT_BINARY_DIR}
   ${Protobuf_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 target_link_libraries(sensorstream_node
   protocol_handler
   ${Protobuf_LIBRARIES}
+  ${OpenCV_LIBRARIES}
 )
 
 ament_target_dependencies(sensorstream_node rclcpp sensor_msgs)
